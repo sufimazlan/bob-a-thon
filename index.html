@@ -1,0 +1,1301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Webcam Gesture Fighter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{ --p1:#00f0ff; --p2:#ff2bd6; --bg:#05030d; --ink:#e8f6ff; --dim:#8a86b8; --gold:#ffe45c; }
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;color:var(--ink);
+    font-family:Rajdhani,"Segoe UI",system-ui,sans-serif;-webkit-user-select:none;user-select:none}
+  canvas#game{display:block;width:100vw;height:100vh}
+  #toolbar{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);display:flex;gap:6px;z-index:6}
+  #toolbar button,#rematchBtn,.btn{font:700 11px/1 Orbitron,system-ui,sans-serif;letter-spacing:.06em;color:var(--ink);
+    background:rgba(12,6,32,.8);border:1px solid rgba(160,140,255,.35);border-radius:6px;padding:7px 9px;cursor:pointer}
+  #toolbar button:hover{border-color:var(--p1)}
+  #toolbar button.on{border-color:var(--p1);box-shadow:0 0 10px rgba(0,240,255,.4);color:#bffbff}
+  #toolbar button.off{color:#ff7b9c;border-color:rgba(255,80,120,.6)}
+  #rematchBtn{position:fixed;left:50%;top:72%;transform:translateX(-50%);z-index:6;display:none;
+    font-size:18px;padding:14px 30px;border-color:var(--gold);color:#fff6c2;box-shadow:0 0 22px rgba(255,228,92,.35)}
+  #soundHint{position:fixed;right:12px;top:calc(12vh + 10px);z-index:6;display:none;padding:6px 10px;border-radius:6px;
+    background:rgba(12,6,32,.85);border:1px solid rgba(255,228,92,.5);color:var(--gold);font:600 14px Rajdhani,sans-serif;pointer-events:none}
+  #overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:8;background:rgba(4,2,12,.6)}
+  #overlay.show{display:flex}
+  .panel{max-width:min(640px,92vw);max-height:86vh;overflow:auto;padding:26px 30px;border-radius:14px;text-align:center;
+    background:linear-gradient(160deg,rgba(20,8,48,.97),rgba(8,4,24,.97));border:1px solid rgba(160,140,255,.35);
+    box-shadow:0 0 40px rgba(255,43,214,.18),0 0 80px rgba(0,240,255,.12)}
+  .panel h1{font:900 clamp(22px,4vw,38px)/1.1 Orbitron,system-ui,sans-serif;margin:0 0 10px;letter-spacing:.05em;
+    background:linear-gradient(90deg,var(--p2),#b388ff,var(--p1));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .panel p{font-size:17px;margin:8px 0;color:#d7d2ff}
+  .panel .small{font-size:14px;color:var(--dim)}
+  .err{margin:14px auto 0;padding:12px 16px;border-radius:8px;border:1px solid rgba(255,80,120,.6);background:rgba(255,40,90,.08);color:#ffc2d1;font-size:16px}
+  .btns{display:flex;gap:10px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+  .btn{font-size:13px;padding:11px 18px}
+  .btn.primary{border-color:var(--p1);box-shadow:0 0 14px rgba(0,240,255,.3)}
+  .set{display:grid;grid-template-columns:1fr auto;gap:12px 18px;text-align:left;align-items:center;margin-top:10px;font-size:16px}
+  .set small{display:block;color:var(--dim);font-size:13px}
+  .set input[type=range]{width:170px}
+  .set input[type=checkbox]{width:20px;height:20px;accent-color:#00f0ff}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="toolbar">
+  <button data-act="settings" title="Settings">⚙ SETTINGS</button>
+  <button data-act="overlay" title="Hand skeletons + per-player CV info">CV OVERLAY</button>
+  <button data-act="debug" title="Confidence breakdown + CV stats">DEBUG</button>
+  <button data-act="sound" title="Sound on/off">SOUND</button>
+  <button data-act="fullscreen" title="Fullscreen">FULLSCREEN</button>
+</div>
+<div id="soundHint">🔈 Click anywhere to enable sound</div>
+<button id="rematchBtn" data-act="rematch">REMATCH</button>
+<div id="overlay"><div class="panel" id="panel"></div></div>
+<noscript><p style="padding:20px">This game needs JavaScript enabled.</p></noscript>
+
+<script type="module">
+/* ============================================================================
+   WEBCAM GESTURE FIGHTER v2 — webcam-only, two-player, MediaPipe hand tracking
+   Pipeline: webcam → MediaPipe Hands (+ optional Pose) → player identification →
+   landmark extraction → position history → velocity / direction / acceleration →
+   gesture classification → confidence check → attack validation → hit → damage → FX
+   Coordinates: every CV result is converted to DISPLAY space (mirrored, x∈[0,1]
+   left→right as the players see it). P2 = left half, P1 = right half.
+   There is deliberately NO keyboard input anywhere in this file.
+   ============================================================================ */
+
+// ---------------------------------------------------------------- Config
+const MP_VERSION = '0.10.14';
+const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+const CFG = {
+  hp: 100,
+  damage: 17,                 // default punch damage
+  cooldown: 600,              // ms
+  confirmMs: 90,              // max time a detected strike is observed before the hit is confirmed
+  conf: 0.70,                 // minimum attack confidence
+  roundTime: 60,              // seconds
+  punch: {
+    minSpeed: 0.6,            // screen-widths / second toward opponent (peak)
+    fullSpeed: 1.4,
+    minDist: 0.06,            // screen-widths travelled toward opponent within the window
+    fullDist: 0.14,
+    window: 260,              // ms of history analysed for one strike
+    fullAccel: 9,             // screen-widths / s²
+    minDirCos: 0.55,          // movement must be mostly horizontal toward the opponent
+  },
+  heavy:    { damage: 25, speed: 1.9, dist: 0.17, conf: 0.80 },
+  special:  { damage: 30, cooldown: 2500, pair: 0.6 },
+  uppercut: { damage: 20, speed: 1.5, dist: 0.12 },
+  reset:    { retract: 0.035, retractFrac: 0.35, lostMs: 300, timeout: 2500 },
+  reach: 0.62,                // max virtual gap between striking hand and opponent body centre
+  opponentMissingMs: 2000,
+  track: { maxJump: 0.2, lostMs: 250, historyMs: 1200, minFrames: 3 },
+  weights: { direction: 0.22, speed: 0.22, acceleration: 0.16, tracking: 0.14, region: 0.14, motion: 0.12 },
+  detectHoldMs: 1500, readyMs: 1400, countdownMs: 3000,
+  cvMaxFps: 30,
+  colors: { 1: '#00f0ff', 2: '#ff2bd6' },
+  soft:   { 1: '#9ffbff', 2: '#ff9aec' },
+};
+const NAMES = { punch: 'PUNCH', heavy: 'HEAVY STRIKE', special: 'SPECIAL', uppercut: 'UPPERCUT' };
+const FONT = 'Orbitron, "Segoe UI", system-ui, sans-serif';
+const MONO = 'ui-monospace, Menlo, Consolas, monospace';
+
+const settings = Object.assign(
+  { sensitivity: 1, pose: true, advanced: true, uppercut: false, overlay: true, debug: false, sound: true },
+  loadSettings());
+function loadSettings() { try { return JSON.parse(localStorage.getItem('wgf-settings') || '{}'); } catch (e) { return {}; } }
+function saveSettings() { try { localStorage.setItem('wgf-settings', JSON.stringify(settings)); } catch (e) {} }
+
+// ---------------------------------------------------------------- Utils
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const c01 = v => clamp(v, 0, 1);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pct = v => Math.round(v * 100) + '%';
+const $ = s => document.querySelector(s);
+let ASPECT = 9 / 16;                       // video height / width (y distances → width units)
+
+// ---------------------------------------------------------------- Globals
+const cvs = $('#game'), ctx = cvs.getContext('2d');
+const video = document.createElement('video');
+video.playsInline = true; video.muted = true; video.autoplay = true; video.setAttribute('playsinline', '');
+video.addEventListener('loadedmetadata', () => { if (video.videoWidth) ASPECT = video.videoHeight / video.videoWidth; });
+
+let W = 0, H = 0, DPR = 1, hudH = 80, botH = 90;
+const feed = { x: 0, y: 0, w: 0, h: 0 };
+let VR = { x: 0, y: 0, w: 1, h: 1 };        // on-screen rect of the (mirrored) camera image
+let state = 'LOADING', stateT = 0, loadingMsg = 'Starting…', fatal = null;
+let posSince = 0, lostSince = 0, lastBeep = 0, fightT = -1e9, roundLeft = CFG.roundTime * 1000;
+let ko = null, result = null, lastNow = performance.now();
+const fps = { v: 60, acc: 0, n: 0 };
+const camera = { active: false, stream: null, error: null, requesting: false };
+
+// ---------------------------------------------------------------- Camera
+const CAM_ERRORS = {
+  denied: 'Camera permission was denied. Click the camera icon in the address bar (or your browser\'s site settings), allow the camera, then press Retry.',
+  notfound: 'No camera was found. Connect a webcam and press Retry.',
+  inuse: 'The camera is in use by another app (Zoom, Teams, FaceTime…). Close it and press Retry.',
+  unsupported: 'This browser cannot access the camera (getUserMedia missing). Use a recent Chrome, Edge or Safari.',
+  insecure: 'Camera access is blocked because the page is not a secure context. Serve it from http://localhost (see README).',
+  lost: 'The camera was disconnected. Reconnect it and press Retry.',
+  other: 'The camera could not be started.',
+};
+
+async function startCamera() {
+  if (camera.requesting || camera.active) return;
+  camera.error = null;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    camera.error = window.isSecureContext === false ? 'insecure' : 'unsupported'; refreshPanel(); return;
+  }
+  camera.requesting = true; refreshPanel();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false,
+    });
+    camera.stream = stream; video.srcObject = stream;
+    await video.play().catch(() => {});
+    stream.getVideoTracks().forEach(t => t.addEventListener('ended', () => { stopCamera(); camera.error = 'lost'; setState('CAMERA_PERMISSION'); }));
+    camera.active = true;
+    Motion.reset();
+  } catch (err) {
+    const n = err && err.name;
+    camera.error =
+      (n === 'NotAllowedError' || n === 'PermissionDeniedError') ? 'denied' :
+      (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') ? 'notfound' :
+      (n === 'NotReadableError' || n === 'TrackStartError' || n === 'AbortError') ? 'inuse' :
+      (n === 'SecurityError') ? 'insecure' : 'other';
+    console.warn('Camera error', err);
+  } finally {
+    camera.requesting = false;
+    checkBootReady();
+    refreshPanel();
+  }
+}
+function stopCamera() {
+  if (camera.stream) camera.stream.getTracks().forEach(t => t.stop());
+  camera.stream = null; camera.active = false;
+  try { video.pause(); } catch (e) {}
+  video.srcObject = null;
+}
+
+// ---------------------------------------------------------------- Computer Vision (MediaPipe)
+const CV = {
+  hand: null, pose: null, ready: false, delegate: '?', poseDelegate: '?',
+  lastVT: -1, lastRun: 0, frame: 0, ms: 0, fps: 0, _n: 0, _t: 0, errors: 0,
+  synthetic: false,                        // dev/test hook: results come from WGF.feed() instead of the camera
+  async load() {
+    loadingMsg = 'Loading MediaPipe vision library…';
+    const mp = await import(`${MP_BASE}/vision_bundle.mjs`);
+    const fileset = await mp.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
+    loadingMsg = 'Loading hand-tracking model…';
+    [this.hand, this.delegate] = await createLandmarker(mp.HandLandmarker, fileset, HAND_MODEL, {
+      numHands: 4, minHandDetectionConfidence: 0.55, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+    });
+    loadingMsg = 'Loading body-tracking model…';
+    try {
+      [this.pose, this.poseDelegate] = await createLandmarker(mp.PoseLandmarker, fileset, POSE_MODEL, {
+        numPoses: 2, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+      });
+    } catch (e) { console.warn('Pose model unavailable — falling back to hand-only player assignment', e); this.pose = null; }
+    this.ready = true;
+  },
+};
+async function createLandmarker(Cls, fileset, model, opts) {
+  let last;
+  for (const delegate of ['GPU', 'CPU']) {
+    try {
+      const lm = await Cls.createFromOptions(fileset, { baseOptions: { modelAssetPath: model, delegate }, runningMode: 'VIDEO', ...opts });
+      return [lm, delegate];
+    } catch (e) { last = e; }
+  }
+  throw last;
+}
+
+function cvStep(now) {
+  if (CV.synthetic || !CV.ready || !camera.active || video.readyState < 2 || !video.videoWidth) return;
+  if (video.currentTime === CV.lastVT) return;               // no new camera frame
+  if (now - CV.lastRun < 1000 / CFG.cvMaxFps - 3) return;    // cap CV rate (~30 fps)
+  CV.lastVT = video.currentTime; CV.lastRun = now;
+  const t0 = performance.now();
+  let hands = [], bodies = null;
+  try {
+    Motion.process();                                        // secondary signal: frame difference
+    hands = parseHands(CV.hand.detectForVideo(video, now));
+    if (settings.pose && CV.pose && CV.frame % 2 === 0) bodies = parseBodies(CV.pose.detectForVideo(video, now));
+  } catch (e) { CV.errors++; if (CV.errors < 5) console.warn('CV frame failed', e); return; }
+  CV.ms = CV.ms * 0.8 + (performance.now() - t0) * 0.2;
+  processFrame(hands, bodies, now);
+}
+
+const PALM = [0, 5, 9, 13, 17];
+function parseHands(res) {
+  const out = [], L = res.landmarks || [], HD = res.handedness || res.handednesses || [];
+  for (let k = 0; k < L.length; k++) {
+    const lm = L[k].map(p => ({ x: 1 - p.x, y: p.y }));      // → display (mirrored) space
+    let x = 0, y = 0; for (const i of PALM) { x += lm[i].x; y += lm[i].y; }
+    const hd = HD[k] && HD[k][0];
+    // MediaPipe labels handedness assuming a mirrored selfie image; our input is un-mirrored, so swap.
+    const handed = hd ? (hd.categoryName === 'Left' ? 'Right' : 'Left') : '?';
+    out.push({ lm, x: x / 5, y: y / 5, score: hd ? hd.score : 0.8, handedness: handed });
+  }
+  return out;
+}
+function parseBodies(res) {
+  const out = [];
+  for (const lm0 of res.landmarks || []) {
+    const lm = lm0.map(p => ({ x: 1 - p.x, y: p.y, v: p.visibility == null ? 1 : p.visibility }));
+    const ls = lm[11], rs = lm[12];
+    if (ls.v < 0.5 || rs.v < 0.5) continue;
+    out.push({
+      x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2, lm,
+      wrists: [lm[15], lm[16]].filter(w => w.v > 0.35),
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- Frame difference (secondary signal)
+const Motion = {
+  W: 96, H: 54, cv: null, cx: null, gray: null, prev: null, mask: null,
+  has: false, prevSum: 0, thr: 22, exposure: false, global: 0, changed: 0, ok: false,
+  init() {
+    this.cv = document.createElement('canvas'); this.cv.width = this.W; this.cv.height = this.H;
+    this.cx = this.cv.getContext('2d', { willReadFrequently: true });
+    const N = this.W * this.H;
+    this.gray = new Uint8ClampedArray(N); this.prev = new Uint8ClampedArray(N); this.mask = new Uint8Array(N);
+  },
+  reset() { this.has = false; this.ok = false; this.exposure = false; },
+  process() {
+    const { W, H } = this, N = W * H, cx = this.cx;
+    cx.setTransform(-1, 0, 0, 1, W, 0); cx.drawImage(video, 0, 0, W, H); cx.setTransform(1, 0, 0, 1, 0, 0);
+    const d = cx.getImageData(0, 0, W, H).data, g = this.gray, p = this.prev, m = this.mask;
+    let sum = 0;
+    for (let i = 0, j = 0; i < N; i++, j += 4) { const v = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8; g[i] = v; sum += v; }
+    if (!this.has) { p.set(g); this.prevSum = sum; this.has = true; return; }
+    const shift = (sum - this.prevSum) / N;               // global brightness compensation
+    let gd = 0, ch = 0;
+    for (let i = 0; i < N; i++) {
+      let df = g[i] - p[i] - shift; if (df < 0) df = -df;
+      gd += df;
+      if (df > this.thr) { m[i] = 1; ch++; } else m[i] = 0;
+    }
+    p.set(g); this.prevSum = sum;
+    this.global = gd / N; this.changed = ch / N;
+    this.exposure = this.global > 18 || Math.abs(shift) > 14 || this.changed > 0.5;   // camera exposure jump
+    this.ok = true;
+  },
+  // fraction of changed pixels around a hand's path (display coords) → 0..1 support score
+  support(x0, y0, x1, y1) {
+    if (!this.ok) return 0.8;
+    const { W, H } = this;
+    const ax = clamp(Math.floor((Math.min(x0, x1) - 0.05) * W), 0, W - 1), bx = clamp(Math.ceil((Math.max(x0, x1) + 0.05) * W), 0, W - 1);
+    const ay = clamp(Math.floor((Math.min(y0, y1) - 0.08) * H), 0, H - 1), by = clamp(Math.ceil((Math.max(y0, y1) + 0.08) * H), 0, H - 1);
+    let c = 0, n = 0;
+    for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) { c += this.mask[y * W + x]; n++; }
+    return n ? c01((c / n) / 0.12) : 0;
+  },
+};
+
+// ---------------------------------------------------------------- Players & hand tracks
+function makePlayer(num) {
+  return {
+    num, dir: num === 1 ? -1 : 1, side: num === 1 ? 'RIGHT' : 'LEFT', color: CFG.colors[num], soft: CFG.soft[num],
+    hp: CFG.hp, ghostHp: CFG.hp, ghostAt: 0, hitT: -1e9,
+    state: 'READY', stateT: 0, cooldownUntil: 0, specialReadyAt: 0,
+    resetTrack: -1, resetAxis: 'x', resetPeak: 0, resetNeed: 0,
+    attackT: -1e9, attackKind: 'punch', lastResult: '', last: null, live: null, pending: null,
+    body: null, bodyVx: 0, bodyX: num === 1 ? 0.75 : 0.25, bodyY: 0.5, lastSeen: -1e9, detected: false,
+    hands: 0, velocity: 0, dirSign: 0, raise: 0,
+    stats: { attempts: 0, hits: 0, dmg: 0 },
+  };
+}
+const players = [makePlayer(1), makePlayer(2)];   // [0] = P1 (RIGHT), [1] = P2 (LEFT)
+const pl = n => players[n - 1];
+const opp = p => players[p.num === 1 ? 1 : 0];
+let tracks = [], nextTrackId = 1;
+
+function poseOwner(x, y, now) {
+  let best = 0, bd = 0.1;
+  for (const p of players) {
+    const b = p.body; if (!b || now - b.t > 400) continue;
+    for (const w of b.wrists) { const d = Math.hypot(x - w.x, (y - w.y) * ASPECT); if (d < bd) { bd = d; best = p.num; } }
+  }
+  return best;
+}
+function initialOwner(h, now) {
+  const po = poseOwner(h.x, h.y, now); if (po) return po;
+  let best = 0, bd = 0.3;
+  for (const p of players) { const b = p.body; if (!b || now - b.t > 600) continue; const d = Math.abs(h.x - b.x); if (d < bd) { bd = d; best = p.num; } }
+  if (best) return best;
+  return h.x >= 0.5 ? 1 : 2;                                  // basic rule: x ≥ 50% → P1, else P2
+}
+
+function updateBodies(bodies, now) {
+  const bs = bodies.slice().sort((a, b) => a.x - b.x);
+  const map = bs.length >= 2 ? [[bs[bs.length - 1], 1], [bs[0], 2]] : bs.length === 1 ? [[bs[0], bs[0].x >= 0.5 ? 1 : 2]] : [];
+  for (const [b, num] of map) {
+    const p = pl(num);
+    if (p.body && now - p.body.t < 400) {
+      const dt = (now - p.body.t) / 1000;
+      if (dt > 0) p.bodyVx = lerp(p.bodyVx, clamp((b.x - p.body.x) / dt, -3, 3), 0.5);
+    } else p.bodyVx = 0;
+    p.body = { ...b, t: now };
+    p.lastSeen = now;
+  }
+}
+
+function matchTracks(hands, now) {
+  const alive = tracks.filter(t => now - t.lastSeen < CFG.track.lostMs);
+  const pairs = [];
+  hands.forEach((h, hi) => alive.forEach((t, ti) => {
+    const dt = (now - t.lastSeen) / 1000;
+    const px = t.x + clamp(t.vx * dt, -0.15, 0.15), py = t.y + clamp(t.vy * dt, -0.15, 0.15);
+    const d = Math.hypot(h.x - px, (h.y - py) * ASPECT);
+    if (d < CFG.track.maxJump) pairs.push([d, hi, ti]);
+  }));
+  pairs.sort((a, b) => a[0] - b[0]);
+  const usedH = new Set(), usedT = new Set();
+  for (const [, hi, ti] of pairs) {
+    if (usedH.has(hi) || usedT.has(ti)) continue;
+    usedH.add(hi); usedT.add(ti);
+    const t = alive[ti], h = hands[hi];
+    const dt = (now - t.lastSeen) / 1000;
+    if (dt > 0) { t.vx = lerp(t.vx, (h.x - t.x) / dt, 0.6); t.vy = lerp(t.vy, (h.y - t.y) / dt, 0.6); }
+    Object.assign(t, { x: h.x, y: h.y, lm: h.lm, score: h.score, handedness: h.handedness, lastSeen: now });
+    t.frames++;
+    t.hist.push({ x: h.x, y: h.y, t: now });
+    while (t.hist.length && now - t.hist[0].t > CFG.track.historyMs) t.hist.shift();
+  }
+  hands.forEach((h, hi) => {
+    if (usedH.has(hi)) return;
+    const t = {
+      id: nextTrackId++, x: h.x, y: h.y, vx: 0, vy: 0, lm: h.lm, dlm: null, score: h.score, handedness: h.handedness,
+      lastSeen: now, created: now, frames: 1, hist: [{ x: h.x, y: h.y, t: now }], player: 0, alt: 0, altOwner: 0, poseLink: 0, k: null, cand: null,
+    };
+    t.player = initialOwner(h, now);
+    alive.push(t);
+  });
+  tracks = alive;
+  // pose-based correction: a track keeps its owner (so a hand crossing the centre line stays with its player)
+  // unless the pose wrist of the other player clearly claims it for 3 consecutive frames
+  for (const t of tracks) {
+    if (t.lastSeen !== now) continue;
+    const po = poseOwner(t.x, t.y, now);
+    t.poseLink = po;
+    if (po && po !== t.player) { t.alt = t.altOwner === po ? t.alt + 1 : 1; t.altOwner = po; if (t.alt >= 3) { t.player = po; t.alt = 0; } }
+    else t.alt = 0;
+  }
+}
+
+// ---------------------------------------------------------------- Movement analysis
+function kinematics(t, dir, bodyVx) {
+  const h = t.hist, n = h.length, cur = h[n - 1];
+  const vel = i => {
+    let j = i; while (j > 0 && h[i].t - h[j].t < 55) j--;
+    const dt = (h[i].t - h[j].t) / 1000;
+    return dt > 0 ? { vx: (h[i].x - h[j].x) / dt, vy: (h[i].y - h[j].y) * ASPECT / dt } : { vx: 0, vy: 0 };
+  };
+  let s = n - 1; while (s > 0 && cur.t - h[s - 1].t <= CFG.punch.window) s--;
+  let back = s, low = s;                                 // most "backward" point (x) and lowest point (y) in window
+  for (let i = s; i < n; i++) { if (h[i].x * dir < h[back].x * dir) back = i; if (h[i].y > h[low].y) low = i; }
+  const span = (cur.t - h[back].t) / 1000;
+  const disp = (cur.x - h[back].x) * dir - bodyVx * dir * span;      // relative to body (walking ≠ punching)
+  const dy = (cur.y - h[back].y) * ASPECT;
+  const up = (h[low].y - cur.y) * ASPECT, dxUp = Math.abs(cur.x - h[low].x);
+  let peak = 0, peakUp = 0, peakAcc = 0, peakAccUp = 0, pv = null, pvu = 0, pt = 0;
+  for (let i = Math.max(1, Math.min(back, low)); i < n; i++) {
+    const v = vel(i), vt = (v.vx - bodyVx) * dir, vu = -v.vy;
+    if (i >= back) peak = Math.max(peak, vt);
+    if (i >= low) peakUp = Math.max(peakUp, vu);
+    if (pv !== null) { const dt = (h[i].t - pt) / 1000; if (dt > 0) { peakAcc = Math.max(peakAcc, (vt - pv) / dt); peakAccUp = Math.max(peakAccUp, (vu - pvu) / dt); } }
+    pv = vt; pvu = vu; pt = h[i].t;
+  }
+  // what the hand was doing *before* the strike began: stillness and oscillation (waving)
+  const onset = h[back].t;
+  let ps = 0, pc = 0, rev = 0, lastSign = 0;
+  for (let i = 1; i <= back; i++) {
+    const age = onset - h[i].t; if (age > 700) continue;
+    const v = vel(i);
+    if (age <= 350) { ps += Math.hypot(v.vx - bodyVx, v.vy); pc++; }
+    const sg = Math.abs(v.vx) > 0.35 ? Math.sign(v.vx) : 0;
+    if (sg && lastSign && sg !== lastSign) rev++;
+    if (sg) lastSign = sg;
+  }
+  const vn = vel(n - 1);
+  return {
+    disp, dy, up, dxUp, peak, peakUp, peakAcc, peakAccUp, prior: pc ? ps / pc : 0, reversals: rev,
+    vx: vn.vx, vy: vn.vy, vToward: (vn.vx - bodyVx) * dir, startX: h[back].x, startY: h[back].y, lowX: h[low].x, lowY: h[low].y,
+  };
+}
+
+function regionScore(p, startX, t) {
+  const over = p.num === 1 ? 0.5 - startX : startX - 0.5;    // > 0 → strike started inside the opponent's half
+  let r = over <= 0 ? 1 : c01(1 - over / 0.12);
+  if (t.poseLink === p.num) r = Math.max(r, 0.97);
+  return r;
+}
+
+function makeCand(kind, parts, gates, t, disp, peak) {
+  let overall = 0;
+  for (const k in CFG.weights) overall += CFG.weights[k] * parts[k];
+  const failed = Object.keys(gates).filter(g => !gates[g]);
+  return { kind, parts, gates, failed, overall, valid: failed.length === 0, track: t, disp, peak };
+}
+
+// Gesture classification + confidence for one hand
+function evaluate(p, t) {
+  const k = t.k, s = settings.sensitivity, C = CFG.punch;
+  const minSpeed = C.minSpeed / s, fullSpeed = C.fullSpeed / s, minDist = C.minDist / s, fullDist = C.fullDist / s;
+  const tracking = c01(t.score) * c01(t.frames / 5);
+  const region = regionScore(p, k.startX, t);
+  const motion = Motion.support(k.startX, k.startY, t.x, t.y);
+  const accelFrom = (acc, prior) => (0.55 * c01(acc / (C.fullAccel / s)) + 0.45 * c01(1 - prior / (0.9 * minSpeed))) * c01(1 - 0.35 * k.reversals);
+
+  // hand orientation from landmarks (wrist → middle-finger MCP): a sideways punch / karate strike points
+  // toward the opponent, a wave points fingers-up. This is what frame differencing cannot tell apart.
+  let toward = 0.5, pointsUp = false;
+  if (t.lm) {
+    const wr = t.lm[0], mc = t.lm[9], ox = mc.x - wr.x, oy = (mc.y - wr.y) * ASPECT, ol = Math.hypot(ox, oy) || 1e-6;
+    toward = c01((ox * p.dir / ol + 0.3) / 0.8);
+    pointsUp = -oy / ol > 0.82;                                // within ~35° of vertical
+  }
+  const len = Math.hypot(k.disp, k.dy) || 1e-6, cos = k.disp / len;
+  const punch = makeCand('punch', {
+    direction: (k.disp > 0 ? c01((cos - C.minDirCos) / (0.93 - C.minDirCos)) : 0) * (0.75 + 0.25 * toward),
+    speed: 0.7 * c01((k.peak - 0.5 * minSpeed) / (fullSpeed - 0.5 * minSpeed)) + 0.3 * c01(k.disp / fullDist),
+    acceleration: accelFrom(k.peakAcc, k.prior),
+    tracking, region, motion,
+  }, {
+    tracked: t.frames >= CFG.track.minFrames,
+    direction: k.disp > 0 && cos >= C.minDirCos,
+    speed: k.peak >= minSpeed,
+    distance: k.disp >= minDist,
+    notWaving: k.reversals < 2 && !pointsUp,
+  }, t, k.disp, k.peak);
+
+  if (!(settings.advanced && settings.uppercut)) return punch;
+  const U = CFG.uppercut, lenU = Math.hypot(k.up, k.dxUp) || 1e-6, cosU = k.up / lenU;
+  const upper = makeCand('uppercut', {
+    direction: k.up > 0 ? c01((cosU - 0.6) / 0.32) : 0,
+    speed: 0.7 * c01((k.peakUp - 0.5 * U.speed / s) / (U.speed / s)) + 0.3 * c01(k.up / (1.6 * U.dist / s)),
+    acceleration: accelFrom(k.peakAccUp, k.prior),
+    tracking, region, motion,
+  }, {
+    tracked: t.frames >= CFG.track.minFrames,
+    direction: k.up > 0 && cosU >= 0.6,
+    speed: k.peakUp >= U.speed / s,
+    distance: k.up >= U.dist / s,
+    notWaving: k.reversals < 2,
+  }, t, k.up, k.peakUp);
+  if (upper.valid && (!punch.valid || upper.overall > punch.overall)) return upper;
+  return punch;
+}
+
+// ---------------------------------------------------------------- Punch state machine (per player)
+// READY → MOVING (hand moving toward opponent) → [ATTACK DETECTED → HIT CONFIRMED] → COOLDOWN → RESET (wait for hand reset) → READY
+function setPState(p, s, now) { if (p.state !== s) { p.state = s; p.stateT = now; } }
+const resetValue = (p, t) => p.resetAxis === 'x' ? t.x * p.dir : -t.y;
+
+function updatePlayer(p, now, practice) {
+  const my = tracks.filter(t => t.player === p.num && now - t.lastSeen < 120);
+  const bodyVx = p.body && now - p.body.t < 400 ? p.bodyVx : 0;
+  let live = null, fastest = null;
+  for (const t of my) {
+    if (t.hist.length < 2) { t.k = null; t.cand = null; continue; }
+    t.k = kinematics(t, p.dir, bodyVx);
+    t.cand = evaluate(p, t);
+    if (!live || t.cand.overall > live.overall) live = t.cand;
+    if (!fastest || Math.abs(t.k.vx) > Math.abs(fastest.k.vx)) fastest = t;
+  }
+  p.live = live;
+  p.velocity = fastest ? Math.abs(fastest.k.vToward) : 0;
+  p.dirSign = fastest && Math.abs(fastest.k.vx) > 0.15 ? Math.sign(fastest.k.vx) : 0;
+
+  if (!practice && p.hp <= 0) { p.pending = null; return; }   // the loser cannot attack
+
+  if (p.state === 'ATTACK') {
+    const rt = p.pending && p.pending.cand.track;
+    if (rt && now - rt.lastSeen < CFG.reset.lostMs) p.resetPeak = Math.max(p.resetPeak, resetValue(p, rt));
+    if (p.pending) updatePending(p, my, now, practice); else setPState(p, 'COOLDOWN', now);
+    return;
+  }
+  if (p.state === 'COOLDOWN' || p.state === 'RESET') {
+    const rt = tracks.find(t => t.id === p.resetTrack);
+    const lost = !rt || now - rt.lastSeen > CFG.reset.lostMs;
+    if (!lost) p.resetPeak = Math.max(p.resetPeak, resetValue(p, rt));
+    if (p.state === 'COOLDOWN' && now >= p.cooldownUntil) setPState(p, 'RESET', now);
+    if (p.state === 'RESET') {
+      const retracted = !lost && p.resetPeak - resetValue(p, rt) >= p.resetNeed;
+      if (lost || retracted || now - p.stateT > CFG.reset.timeout) setPState(p, 'READY', now);
+    }
+    return;
+  }
+
+  const moving = my.some(t => t.k && t.k.vToward > 0.4 * CFG.punch.minSpeed / settings.sensitivity);
+  if (p.state === 'READY' && moving) setPState(p, 'MOVING', now);
+  else if (p.state === 'MOVING' && !moving && now - p.stateT > 150) setPState(p, 'READY', now);
+
+  if (Motion.exposure) return;                                // ignore frames with a camera exposure jump
+  const cands = my.map(t => t.cand).filter(c => c && c.valid && c.overall >= CFG.conf).sort((a, b) => b.overall - a.overall);
+  if (cands.length) attack(p, cands[0], my, now);
+}
+
+// ATTACK DETECTED: the strike passed every gate. Keep watching it for a few frames (≤ confirmMs) to measure
+// its full length/speed and whether the other hand joins in, then confirm → classify → validate → damage.
+function attack(p, cand, my, now) {
+  p.attackT = now; p.attackKind = cand.kind; p.lastResult = '';
+  p.pending = { cand, t0: now, disp: cand.disp, peak: cand.peak, other: 0 };
+  p.cooldownUntil = now + CFG.cooldown;
+  p.resetTrack = cand.track.id; p.resetAxis = cand.kind === 'uppercut' ? 'y' : 'x';
+  p.resetPeak = resetValue(p, cand.track);
+  setPState(p, 'ATTACK', now);
+  Sound.play('whoosh');
+}
+
+function updatePending(p, my, now, practice) {
+  const pd = p.pending, t = pd.cand.track, k = t.k;
+  const s = settings.sensitivity, C = CFG.punch;
+  if (k) { pd.disp = Math.max(pd.disp, pd.cand.kind === 'uppercut' ? k.up : k.disp); pd.peak = Math.max(pd.peak, pd.cand.kind === 'uppercut' ? k.peakUp : k.peak); }
+  for (const o of my) if (o !== t && o.k && o.k.disp >= CFG.special.pair * C.minDist / s && o.k.peak >= CFG.special.pair * C.minSpeed / s) pd.other++;
+  const stopped = !k || now - t.lastSeen > 100 || (pd.cand.kind === 'uppercut' ? -k.vy : k.vToward) < 0.3 * C.minSpeed / s;
+  if (now - pd.t0 >= CFG.confirmMs || (stopped && now - pd.t0 >= 30)) { p.pending = null; confirm(p, pd, now, practice); }
+}
+
+// HIT CONFIRMED (or rejected): classify the strike, validate target/range, apply damage.
+function confirm(p, pd, now, practice) {
+  const s = settings.sensitivity, cand = pd.cand, t = cand.track;
+  let kind = cand.kind, dmg = kind === 'uppercut' ? CFG.uppercut.damage : CFG.damage;
+  if (kind === 'punch' && settings.advanced) {
+    if (pd.other && now >= p.specialReadyAt) { kind = 'special'; dmg = CFG.special.damage; }
+    else if (pd.peak >= CFG.heavy.speed / s && pd.disp >= CFG.heavy.dist / s && cand.overall >= CFG.heavy.conf) { kind = 'heavy'; dmg = CFG.heavy.damage; }
+  }
+  p.attackKind = kind;
+  p.last = { kind, overall: cand.overall, parts: { ...cand.parts }, disp: pd.disp, peak: pd.peak, t: now, latency: now - pd.t0 };
+  if (kind === 'special') p.specialReadyAt = now + CFG.special.cooldown;
+  p.resetNeed = Math.max(CFG.reset.retract, CFG.reset.retractFrac * pd.disp);
+  setPState(p, 'COOLDOWN', now);
+
+  if (practice) {
+    p.lastResult = 'TEST';
+    FX.floater(t.x, t.y - 0.1, `${NAMES[kind]} ✓ ${pct(cand.overall)}`, p.color, 22);
+    return;
+  }
+  const o = opp(p);
+  p.stats.attempts++;
+  let res;
+  if (ko || p.hp <= 0 || o.hp <= 0) res = 'NONE';
+  else if (now - o.lastSeen > CFG.opponentMissingMs) res = 'NO TARGET';            // opponent must exist
+  else if (Math.abs(o.bodyX - t.x) > CFG.reach) res = 'OUT OF RANGE';               // virtual combat distance
+  else res = 'HIT';
+  p.lastResult = res;
+  if (kind === 'special') Sound.play('special');
+  if (res === 'HIT') {
+    o.hp = Math.max(0, o.hp - dmg);
+    o.ghostAt = now + 450; o.hitT = now;
+    p.stats.hits++; p.stats.dmg += dmg;
+    FX.hit(p, o, t, kind, dmg);
+    if (o.hp === 0) { ko = { t: now, winner: p.num, loser: o.num }; FX.banner('K.O.!', '#ff4d6d', 1600); Sound.play('ko'); FX.shake = 26; }
+  } else if (res !== 'NONE') {
+    FX.floater(t.x, t.y - 0.1, res === 'OUT OF RANGE' ? 'TOO FAR!' : 'NO TARGET', '#c9c4ff', 24);
+    FX.bolts.push({ x0: t.x, y0: t.y, x1: t.x + p.dir * 0.12, y1: t.y, color: p.color, t: now, dur: 160, w: 1 });
+    Sound.play('miss');
+  }
+}
+
+// One CV frame: identification → tracking → state machines
+function processFrame(hands, bodies, now) {
+  CV.frame++; CV._n++;
+  if (now - CV._t >= 1000) { CV.fps = CV._n * 1000 / (now - CV._t); CV._n = 0; CV._t = now; }
+  if (bodies) updateBodies(bodies, now);
+  // background filter: when both bodies are known, ignore hands far away from either player
+  const bodiesKnown = players.every(p => p.body && now - p.body.t < 600);
+  if (bodiesKnown) hands = hands.filter(h => players.some(p => Math.abs(h.x - p.body.x) < 0.42));
+  matchTracks(hands, now);
+  for (const t of tracks) if (t.lastSeen === now && t.player) pl(t.player).lastSeen = now;
+
+  for (const p of players) {
+    p.hands = tracks.filter(t => t.player === p.num && now - t.lastSeen < 150).length;
+    if (p.body && now - p.body.t < 500) { p.bodyX = lerp(p.bodyX, p.body.x, 0.5); p.bodyY = lerp(p.bodyY, p.body.y, 0.5); }
+    else if (p.hands && p.state === 'READY') {
+      const hs = tracks.filter(t => t.player === p.num && now - t.lastSeen < 150);
+      const mx = hs.reduce((a, t) => a + t.x, 0) / hs.length - p.dir * 0.06;
+      const my = hs.reduce((a, t) => a + t.y, 0) / hs.length + 0.08;
+      p.bodyX = lerp(p.bodyX, mx, 0.08); p.bodyY = lerp(p.bodyY, clamp(my, 0.2, 0.8), 0.08);
+    }
+    p.bodyX = p.num === 1 ? clamp(p.bodyX, 0.4, 1) : clamp(p.bodyX, 0, 0.6);
+  }
+
+  const combat = state === 'FIGHTING';
+  const practice = state === 'PLAYER_POSITIONING' || state === 'READY';
+  for (const p of players) {
+    if (combat || practice) updatePlayer(p, now, practice);
+    else { p.live = null; for (const t of tracks) { t.k = null; t.cand = null; } }
+  }
+}
+
+// ---------------------------------------------------------------- Game state manager
+function setState(s) { state = s; stateT = performance.now(); refreshPanel(); }
+
+function checkBootReady() {
+  if (fatal) return;
+  if (state === 'LOADING' && CV.ready && !camera.active) setState('CAMERA_PERMISSION');
+  if ((state === 'LOADING' || state === 'CAMERA_PERMISSION') && CV.ready && camera.active) enterPositioning();
+}
+function enterPositioning() { resetMatch(); posSince = 0; setState('PLAYER_POSITIONING'); }
+
+function resetMatch() {
+  const now = performance.now();
+  for (const p of players) {
+    Object.assign(p, { hp: CFG.hp, ghostHp: CFG.hp, state: 'READY', stateT: now, cooldownUntil: 0, specialReadyAt: 0,
+      attackT: -1e9, lastResult: '', last: null, pending: null, raise: 0, stats: { attempts: 0, hits: 0, dmg: 0 } });
+  }
+  ko = null; result = null; roundLeft = CFG.roundTime * 1000;
+  FX.reset();
+}
+
+function endRound(reason) {
+  const [a, b] = players;
+  const winner = reason === 'K.O.' ? ko.winner : a.hp === b.hp ? 0 : a.hp > b.hp ? 1 : 2;
+  result = { winner, reason };
+  Sound.play('win');
+  setState('GAME_OVER');
+}
+
+function rematch() {
+  if (state !== 'GAME_OVER') return;
+  Sound.unlock();
+  setState('REMATCH');
+}
+
+function update(now, dt) {
+  for (const p of players) {
+    p.detected = now - p.lastSeen < 600;
+    if (now > p.ghostAt) p.ghostHp = Math.max(p.hp, p.ghostHp - dt * 0.045);
+  }
+  switch (state) {
+    case 'PLAYER_POSITIONING':
+      if (players.every(p => p.detected)) { if (!posSince) posSince = now; if (now - posSince >= CFG.detectHoldMs) setState('READY'); }
+      else posSince = 0;
+      break;
+    case 'READY':
+      if (!players.every(p => p.detected)) { if (!lostSince) lostSince = now; if (now - lostSince > 700) { lostSince = 0; posSince = 0; setState('PLAYER_POSITIONING'); } }
+      else lostSince = 0;
+      if (state === 'READY' && now - stateT >= CFG.readyMs) { resetMatch(); lastBeep = 0; setState('COUNTDOWN'); }
+      break;
+    case 'COUNTDOWN': {
+      const n = Math.ceil((stateT + CFG.countdownMs - now) / 1000);
+      if (n !== lastBeep && n > 0) { lastBeep = n; Sound.play('beep'); }
+      if (now >= stateT + CFG.countdownMs) { setState('FIGHTING'); fightT = now; Sound.play('fight'); }
+      break;
+    }
+    case 'FIGHTING':
+      if (ko) { if (now - ko.t > 1700) endRound('K.O.'); }
+      else { roundLeft -= dt; if (roundLeft <= 0) { roundLeft = 0; endRound('TIME'); } }
+      break;
+    case 'GAME_OVER':
+      // webcam rematch: both players raise a hand above their head
+      for (const p of players) {
+        const up = tracks.some(t => t.player === p.num && now - t.lastSeen < 200 && t.y < 0.28);
+        p.raise = up ? Math.min(1, p.raise + dt / 1200) : Math.max(0, p.raise - dt / 2000);
+      }
+      if (now - stateT > 1500 && players.every(p => p.raise >= 1)) rematch();
+      break;
+    case 'REMATCH':
+      if (now - stateT > 900) enterPositioning();
+      break;
+  }
+  FX.update(now, dt);
+  $('#rematchBtn').style.display = state === 'GAME_OVER' ? 'block' : 'none';
+}
+
+// ---------------------------------------------------------------- Effects
+const FX = {
+  parts: [], floaters: [], rings: [], bolts: [], shake: 0, flash: { 1: 0, 2: 0 }, banners: [],
+  reset() { this.parts = []; this.floaters = []; this.rings = []; this.bolts = []; this.shake = 0; this.flash = { 1: 0, 2: 0 }; this.banners = []; },
+  floater(x, y, text, color, size, dur = 950) { this.floaters.push({ x, y, text, color, size, t: performance.now(), dur }); },
+  banner(text, color, dur = 900) { this.banners.push({ text, color, t: performance.now(), dur }); },
+  burst(sx, sy, color, n, speed) {
+    for (let k = 0; k < n; k++) {
+      const a = rand(0, Math.PI * 2), v = rand(0.3, 1) * speed;
+      this.parts.push({ x: sx, y: sy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 1.5, life: 0, max: rand(350, 800), color, size: rand(2, 6) });
+    }
+  },
+  hit(p, o, t, kind, dmg) {
+    const now = performance.now();
+    const big = kind !== 'punch';
+    this.bolts.push({ x0: t.x, y0: t.y, x1: o.bodyX, y1: o.bodyY, color: p.color, t: now, dur: kind === 'special' ? 380 : 200, w: kind === 'special' ? 3 : big ? 2 : 1 });
+    const [sx, sy] = toS(o.bodyX, o.bodyY);
+    this.burst(sx, sy, p.color, big ? 50 : 28, big ? 11 : 8);
+    this.burst(sx, sy, '#ffffff', big ? 16 : 8, big ? 8 : 5);
+    this.rings.push({ x: o.bodyX, y: o.bodyY, color: p.color, r: big ? 0.22 : 0.13, t: now, dur: 420 });
+    this.floater(o.bodyX, o.bodyY - 0.16, '-' + dmg, kind === 'special' ? '#ffe45c' : '#ffffff', big ? 64 : 54, 1100);
+    this.floater(o.bodyX, o.bodyY - 0.05, kind === 'punch' ? 'HIT!' : NAMES[kind] + '!', p.color, big ? 34 : 28, 800);
+    this.shake = Math.max(this.shake, kind === 'special' ? 20 : kind === 'heavy' ? 13 : 7);
+    this.flash[o.num] = 1;
+    if (kind === 'special') this.banner('SPECIAL ATTACK!', p.color, 1000);
+    Sound.play(kind === 'heavy' ? 'heavy' : kind === 'special' ? 'specialHit' : 'hit');
+  },
+  update(now, dt) {
+    const k = dt / 16.67;
+    for (const q of this.parts) { q.life += dt; q.x += q.vx * k; q.y += q.vy * k; q.vy += 0.3 * k; q.vx *= Math.pow(0.97, k); }
+    this.parts = this.parts.filter(q => q.life < q.max);
+    this.floaters = this.floaters.filter(f => now - f.t < f.dur);
+    this.rings = this.rings.filter(r => now - r.t < r.dur);
+    this.bolts = this.bolts.filter(b => now - b.t < b.dur);
+    this.banners = this.banners.filter(b => now - b.t < b.dur);
+    this.shake *= Math.pow(0.86, k); if (this.shake < 0.3) this.shake = 0;
+    for (const n of [1, 2]) this.flash[n] = Math.max(0, this.flash[n] - dt / 260);
+  },
+};
+
+// ---------------------------------------------------------------- Audio (Web Audio synth)
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const Sound = {
+  ctx: null, master: null, noiseBuf: null,
+  unlock() {
+    if (!settings.sound) return;
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+      try { this.ctx = new AC(); } catch (e) { return; }
+      const c = this.ctx;
+      this.master = c.createGain(); this.master.gain.value = 0.7;
+      const comp = c.createDynamicsCompressor(); this.master.connect(comp); comp.connect(c.destination);
+      this.noiseBuf = c.createBuffer(1, c.sampleRate, c.sampleRate);
+      const d = this.noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+  get on() { return settings.sound && this.ctx && this.ctx.state === 'running'; },
+  tone(f0, f1, dur, type = 'square', vol = 0.3, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t);
+    if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.03);
+  },
+  noise(dur, vol = 0.3, type = 'bandpass', f0 = 1000, f1 = 0, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(); s.buffer = this.noiseBuf;
+    const f = c.createBiquadFilter(); f.type = type; f.frequency.setValueAtTime(f0, t);
+    if (f1) f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = c.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.03);
+  },
+  play(name) {
+    if (!this.on) return;
+    switch (name) {
+      case 'whoosh':     this.noise(0.12, 0.45, 'bandpass', 2400, 600); break;
+      case 'miss':       this.noise(0.14, 0.25, 'highpass', 2500, 900); break;
+      case 'hit':        this.noise(0.13, 0.7, 'lowpass', 2600, 150); this.tone(170, 45, 0.16, 'sine', 0.7); break;
+      case 'heavy':      this.noise(0.24, 0.85, 'lowpass', 1800, 100); this.tone(110, 35, 0.3, 'sine', 0.8); this.tone(80, 40, 0.25, 'sawtooth', 0.15); break;
+      case 'special':    this.tone(180, 1400, 0.4, 'sawtooth', 0.16); this.noise(0.45, 0.25, 'bandpass', 400, 4000); break;
+      case 'specialHit': this.noise(0.4, 0.9, 'lowpass', 3000, 90); this.tone(90, 30, 0.5, 'sine', 0.9); break;
+      case 'ko':         this.tone(440, 40, 1.3, 'sawtooth', 0.3); this.noise(1.2, 0.5, 'lowpass', 3000, 80); this.tone(55, 30, 1.4, 'sine', 0.7); break;
+      case 'beep':       this.tone(660, 0, 0.15, 'square', 0.2); break;
+      case 'fight':      [0, 4, 7, 12].forEach((n, k) => this.tone(mtof(69 + n), 0, 0.6, 'sawtooth', 0.1, k * 0.03)); this.noise(0.4, 0.3, 'highpass', 3000, 600); break;
+      case 'win':        [0, 4, 7, 12, 16].forEach((n, k) => this.tone(mtof(64 + n), 0, 0.3, 'square', 0.1, k * 0.12)); break;
+      case 'ready':      this.tone(880, 1320, 0.2, 'triangle', 0.2); break;
+    }
+  },
+};
+
+// ---------------------------------------------------------------- Renderer
+function layout() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(320, window.innerWidth); H = Math.max(240, window.innerHeight);
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+  hudH = clamp(H * 0.12, 70, 110); botH = clamp(H * 0.13, 80, 120);
+  Object.assign(feed, { x: 0, y: hudH, w: W, h: Math.max(80, H - hudH - botH) });
+  $('#soundHint').style.top = (hudH + 10) + 'px';
+}
+function computeVR() {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const sc = Math.min(feed.w / vw, feed.h / vh), w = vw * sc, h = vh * sc;
+  VR = { x: feed.x + (feed.w - w) / 2, y: feed.y + (feed.h - h) / 2, w, h };
+}
+const toS = (x, y) => [VR.x + x * VR.w, VR.y + y * VR.h];
+
+function txt(s, x, y, size, color, align = 'center', font = FONT, weight = 900, glow = 0) {
+  ctx.font = `${weight} ${size}px ${font}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+  if (glow) ctx.shadowBlur = 0;
+}
+function outlined(s, x, y, size, color, glow = 16) {
+  ctx.font = `900 ${size}px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineWidth = Math.max(3, size / 10); ctx.strokeStyle = 'rgba(5,2,15,0.85)'; ctx.strokeText(s, x, y);
+  txt(s, x, y, size, color, 'center', FONT, 900, glow);
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function box(x, y, w, h, stroke, alpha = 0.78) {
+  ctx.save(); ctx.fillStyle = `rgba(8,4,24,${alpha})`; ctx.strokeStyle = stroke; ctx.lineWidth = 1.5;
+  roundRect(x, y, w, h, 8); ctx.fill(); ctx.stroke(); ctx.restore();
+}
+
+function drawFeed(now) {
+  const g = ctx.createLinearGradient(0, feed.y, 0, feed.y + feed.h);
+  g.addColorStop(0, '#0a0420'); g.addColorStop(1, '#05020c');
+  ctx.fillStyle = g; ctx.fillRect(feed.x, feed.y, feed.w, feed.h);
+  if (camera.active && video.readyState >= 2) {
+    ctx.save();
+    ctx.translate(VR.x + VR.w, VR.y); ctx.scale(-1, 1);            // mirrored preview
+    ctx.drawImage(video, 0, 0, VR.w, VR.h);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = '#0d0726'; ctx.fillRect(VR.x, VR.y, VR.w, VR.h);
+    txt(CV.synthetic ? 'SIMULATED CV INPUT' : 'CAMERA FEED', VR.x + VR.w / 2, VR.y + VR.h / 2, 20, 'rgba(200,190,255,0.3)');
+  }
+  // side tints + victim hit flash
+  for (const p of players) {
+    const x0 = p.num === 2 ? VR.x : VR.x + VR.w / 2;
+    ctx.fillStyle = hexA(p.color, 0.05); ctx.fillRect(x0, VR.y, VR.w / 2, VR.h);
+    if (FX.flash[p.num] > 0) { ctx.fillStyle = `rgba(255,50,80,${0.38 * FX.flash[p.num]})`; ctx.fillRect(x0, VR.y, VR.w / 2, VR.h); }
+  }
+  ctx.save(); ctx.strokeStyle = 'rgba(179,136,255,0.55)'; ctx.lineWidth = 2; ctx.shadowColor = '#b388ff'; ctx.shadowBlur = 14;
+  ctx.strokeRect(VR.x, VR.y, VR.w, VR.h); ctx.restore();
+  // centre boundary
+  const cx = VR.x + VR.w / 2;
+  ctx.save(); ctx.setLineDash([12, 9]); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(235,225,255,0.75)';
+  ctx.shadowColor = '#b388ff'; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.moveTo(cx, VR.y); ctx.lineTo(cx, VR.y + VR.h); ctx.stroke(); ctx.restore();
+  txt('PLAYER 2', cx - 12, VR.y + 16, 12, CFG.colors[2], 'right', FONT, 900, 8);
+  txt('PLAYER 1', cx + 12, VR.y + 16, 12, CFG.colors[1], 'left', FONT, 900, 8);
+}
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+
+const HAND_CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const POSE_CONN = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24]];
+
+function drawCV(now) {
+  // pose skeletons (faint)
+  for (const p of players) {
+    const b = p.body; if (!b || now - b.t > 500 || !b.lm) continue;
+    ctx.save(); ctx.strokeStyle = hexA(p.color, 0.45); ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (const [a, c] of POSE_CONN) { const A = b.lm[a], C = b.lm[c]; if (A.v < 0.4 || C.v < 0.4) continue; ctx.moveTo(...toS(A.x, A.y)); ctx.lineTo(...toS(C.x, C.y)); }
+    ctx.stroke();
+    const [sx, sy] = toS(b.x, b.y);
+    ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  // hand skeletons (smoothed between CV updates) + velocity vectors
+  for (const t of tracks) {
+    if (now - t.lastSeen > 150) continue;
+    const col = t.player ? CFG.colors[t.player] : '#999';
+    const attacking = t.player && pl(t.player).resetTrack === t.id && now - pl(t.player).attackT < 400;
+    if (t.lm) {
+      if (!t.dlm || t.dlm.length !== t.lm.length) t.dlm = t.lm.map(q => ({ ...q }));
+      else for (let i = 0; i < t.lm.length; i++) { t.dlm[i].x = lerp(t.dlm[i].x, t.lm[i].x, 0.55); t.dlm[i].y = lerp(t.dlm[i].y, t.lm[i].y, 0.55); }
+      const L = t.dlm;
+      ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = attacking ? 4 : 2.5; ctx.shadowColor = col; ctx.shadowBlur = attacking ? 24 : 8;
+      ctx.beginPath();
+      for (const [a, c] of HAND_CONN) { ctx.moveTo(...toS(L[a].x, L[a].y)); ctx.lineTo(...toS(L[c].x, L[c].y)); }
+      ctx.stroke(); ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff';
+      for (let i = 0; i < L.length; i++) { const [x, y] = toS(L[i].x, L[i].y); ctx.beginPath(); ctx.arc(x, y, i === 0 ? 4.5 : 2.6, 0, Math.PI * 2); ctx.fill(); }
+      ctx.restore();
+    } else {
+      const [x, y] = toS(t.x, t.y);
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill();
+    }
+    // velocity vector
+    const [px, py] = toS(t.x, t.y);
+    const ax = t.vx * VR.w * 0.12, ay = t.vy * VR.h * 0.12, len = Math.hypot(ax, ay);
+    if (len > 8) {
+      const ang = Math.atan2(ay, ax), ex = px + ax, ey = py + ay;
+      ctx.save(); ctx.strokeStyle = '#ffe45c'; ctx.fillStyle = '#ffe45c'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - 11 * Math.cos(ang - 0.45), ey - 11 * Math.sin(ang - 0.45));
+      ctx.lineTo(ex - 11 * Math.cos(ang + 0.45), ey - 11 * Math.sin(ang + 0.45)); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    if (settings.debug) txt(`#${t.id} ${t.handedness[0] || '?'} P${t.player}`, px, py + 26, 11, col, 'center', MONO, 600);
+  }
+}
+
+function stateLabel(p, now) {
+  if (p.hp <= 0 && (state === 'FIGHTING' || state === 'GAME_OVER')) return 'K.O.';
+  if (p.state === 'ATTACK') return 'ATTACK DETECTED';
+  if (p.lastResult === 'HIT' && now - p.attackT < 450) return 'HIT CONFIRMED';
+  return { READY: 'READY', MOVING: 'HAND MOVING TOWARD OPPONENT', COOLDOWN: 'COOLDOWN', RESET: 'WAIT FOR HAND RESET' }[p.state];
+}
+
+function drawInfoPanels(now) {
+  for (const p of players) {
+    const w = clamp(VR.w * 0.2, 170, 230), h = 118;
+    const x = p.num === 2 ? VR.x + 10 : VR.x + VR.w - w - 10, y = VR.y + 34;
+    box(x, y, w, h, hexA(p.color, 0.7));
+    const recent = p.last && now - p.last.t < 900;
+    const conf = recent ? p.last.overall : p.live ? p.live.overall : 0;
+    const action = recent && p.lastResult !== 'NONE' ? NAMES[p.last.kind] + (p.lastResult === 'HIT' || p.lastResult === 'TEST' ? '' : ' (' + p.lastResult.toLowerCase() + ')') : stateLabel(p, now);
+    const lines = [
+      [p.hands ? `✓ Hand detected (${p.hands})` : '✗ No hand detected', p.hands ? '#b8ffcf' : '#ff9aac'],
+      [`Direction: ${p.dirSign < 0 ? '←' : p.dirSign > 0 ? '→' : '·'}   (attacks ${p.num === 1 ? '←' : '→'})`, '#e0dcff'],
+      [`Velocity: ${p.velocity.toFixed(2)}`, '#e0dcff'],
+      [`Confidence: ${pct(conf)}`, conf >= CFG.conf ? '#b8ffcf' : '#e0dcff'],
+      [`Action: ${action}`, recent ? '#ffe45c' : '#e0dcff'],
+    ];
+    txt(`PLAYER ${p.num}`, x + 10, y + 15, 12, p.color, 'left', FONT, 900);
+    lines.forEach(([s, c], i) => txt(s, x + 10, y + 35 + i * 17, 12.5, c, 'left', MONO, 600));
+  }
+}
+
+function drawEffects(now) {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round';
+  for (const b of FX.bolts) {
+    const k = (now - b.t) / b.dur, a = 1 - k;
+    const [x0, y0] = toS(b.x0, b.y0), [x1, y1] = toS(b.x1, b.y1);
+    const hx = lerp(x0, x1, c01(k * 2.2)), hy = lerp(y0, y1, c01(k * 2.2));      // travelling fist
+    ctx.globalAlpha = a; ctx.strokeStyle = b.color; ctx.shadowColor = b.color; ctx.shadowBlur = 30;
+    ctx.lineWidth = 10 * b.w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3 * b.w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(hx, hy, 9 * b.w, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+  for (const r of FX.rings) {
+    const k = (now - r.t) / r.dur, [x, y] = toS(r.x, r.y);
+    ctx.globalAlpha = 1 - k; ctx.strokeStyle = r.color; ctx.lineWidth = 5 * (1 - k) + 1;
+    ctx.beginPath(); ctx.arc(x, y, r.r * VR.w * k, 0, Math.PI * 2); ctx.stroke();
+  }
+  for (const q of FX.parts) { ctx.globalAlpha = 1 - q.life / q.max; ctx.fillStyle = q.color; ctx.fillRect(q.x - q.size / 2, q.y - q.size / 2, q.size, q.size); }
+  ctx.restore();
+  for (const f of FX.floaters) {
+    const k = (now - f.t) / f.dur, [x, y] = toS(f.x, f.y);
+    const pop = k < 0.12 ? 0.5 + k / 0.12 * 0.7 : 1.2 - Math.min(0.2, k - 0.12);
+    ctx.save(); ctx.globalAlpha = k > 0.7 ? (1 - k) / 0.3 : 1;
+    ctx.translate(x, y - k * 40); ctx.scale(pop, pop);
+    outlined(f.text, 0, 0, clamp(f.size * VR.w / 1100, f.size * 0.55, f.size), f.color);
+    ctx.restore();
+  }
+  for (const b of FX.banners) {
+    const k = (now - b.t) / b.dur;
+    ctx.save(); ctx.globalAlpha = k > 0.75 ? (1 - k) / 0.25 : 1;
+    const size = clamp(VR.w * 0.1, 44, 130) * (k < 0.15 ? 1.4 - k / 0.15 * 0.4 : 1);
+    outlined(b.text, VR.x + VR.w / 2, VR.y + VR.h * 0.42, size, b.color, 36);
+    ctx.restore();
+  }
+}
+
+function drawHUD(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, hudH);
+  g.addColorStop(0, '#0d0626'); g.addColorStop(1, '#070318');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, hudH);
+  ctx.fillStyle = 'rgba(179,136,255,0.5)'; ctx.fillRect(0, hudH - 2, W, 2);
+  const pad = Math.max(14, W * 0.02), timerW = clamp(W * 0.1, 70, 120);
+  const barW = (W - timerW - pad * 4) / 2, barH = clamp(hudH * 0.24, 14, 26), by = hudH * 0.36;
+  for (const p of players) {
+    const left = p.num === 2, x = left ? pad : W - pad - barW;
+    txt(`PLAYER ${p.num}`, left ? x : x + barW, hudH * 0.16, clamp(hudH * 0.16, 11, 17), p.color, left ? 'left' : 'right', FONT, 900, 10);
+    txt(p.num === 2 ? 'LEFT SIDE · ATTACKS →' : '← ATTACKS · RIGHT SIDE', left ? x + barW : x, hudH * 0.16, clamp(hudH * 0.11, 9, 12), 'rgba(200,190,255,0.55)', left ? 'right' : 'left', FONT, 700);
+    drawHPBar(p, x, by, barW, barH, left, now);
+    const shakeX = now - p.hitT < 300 ? rand(-3, 3) : 0;
+    txt(`${Math.ceil(p.hp)} HP`, (left ? x : x + barW) + shakeX, by + barH + hudH * 0.2, clamp(hudH * 0.2, 13, 22), p.hp <= 34 ? '#ff6b86' : '#fff', left ? 'left' : 'right', FONT, 900);
+  }
+  const t = Math.ceil(roundLeft / 1000), low = t <= 10 && state === 'FIGHTING';
+  ctx.save(); ctx.strokeStyle = low ? '#ff4d6d' : 'rgba(179,136,255,0.75)'; ctx.lineWidth = 2; ctx.shadowColor = ctx.strokeStyle; ctx.shadowBlur = 12;
+  roundRect(W / 2 - timerW / 2, hudH * 0.12, timerW, hudH * 0.62, 8); ctx.fillStyle = 'rgba(5,2,15,0.85)'; ctx.fill(); ctx.stroke(); ctx.restore();
+  txt(String(t), W / 2, hudH * 0.43, clamp(hudH * 0.4, 20, 40) * (low ? 1 + 0.08 * Math.sin(now / 90) : 1), low ? '#ff6b86' : '#fff', 'center', FONT, 900, 12);
+  txt('TIME', W / 2, hudH * 0.86, 10, 'rgba(200,190,255,0.6)', 'center', FONT, 700);
+}
+
+function drawHPBar(p, x, y, w, h, left, now) {
+  const sk = h * 0.6;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x + (left ? sk : 0), y); ctx.lineTo(x + w - (left ? 0 : sk), y);
+  ctx.lineTo(x + w - (left ? sk : 0), y + h); ctx.lineTo(x + (left ? 0 : sk), y + h); ctx.closePath();
+  ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fill();
+  ctx.save(); ctx.clip();
+  const gw = w * p.ghostHp / CFG.hp, fw = w * p.hp / CFG.hp;
+  ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.fillRect(left ? x : x + w - gw, y, gw, h);   // damage "ghost"
+  const lowHp = p.hp <= 34, c1 = lowHp ? '#ff4d6d' : p.color, c2 = lowHp ? '#ff9a3c' : (p.num === 1 ? '#6a5cff' : '#8c3cff');
+  const gr = ctx.createLinearGradient(x, 0, x + w, 0);
+  gr.addColorStop(0, left ? c1 : c2); gr.addColorStop(1, left ? c2 : c1);
+  ctx.fillStyle = gr; if (lowHp) ctx.globalAlpha = 0.75 + 0.25 * Math.sin(now / 90);
+  ctx.fillRect(left ? x : x + w - fw, y, fw, h);
+  ctx.globalAlpha = 1; ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(x, y, w, h * 0.35);
+  ctx.restore();
+  ctx.strokeStyle = p.color; ctx.lineWidth = 2; ctx.shadowColor = p.color; ctx.shadowBlur = 12; ctx.stroke();
+  ctx.restore();
+}
+
+function drawBottom(now) {
+  const y0 = H - botH;
+  const g = ctx.createLinearGradient(0, y0, 0, H);
+  g.addColorStop(0, '#0d0626'); g.addColorStop(1, '#05020c');
+  ctx.fillStyle = g; ctx.fillRect(0, y0, W, botH);
+  ctx.fillStyle = 'rgba(179,136,255,0.5)'; ctx.fillRect(0, y0, W, 2);
+  for (const p of players) {
+    const cx = p.num === 2 ? W * 0.2 : W * 0.8, cy = y0 + botH * 0.38;
+    let text, color = '#fff', size = clamp(botH * 0.34, 18, 38);
+    const recent = now - p.attackT < 700 && p.lastResult && p.lastResult !== 'NONE';
+    if (state === 'LOADING' || state === 'CAMERA_PERMISSION') { text = '—'; color = 'rgba(200,190,255,0.4)'; }
+    else if (p.hp <= 0 && (state === 'FIGHTING' || state === 'GAME_OVER')) { text = 'K.O.'; color = '#ff4d6d'; }
+    else if (recent) {
+      if (p.lastResult === 'HIT' || p.lastResult === 'TEST') { text = `"${NAMES[p.attackKind]}!"`; color = p.color; }
+      else { text = p.lastResult === 'OUT OF RANGE' ? 'TOO FAR!' : 'NO TARGET'; color = '#c9c4ff'; }
+    } else if (!p.detected && state !== 'LOADING' && state !== 'CAMERA_PERMISSION') { text = 'NOT DETECTED'; color = '#ff9aac'; size *= 0.75; }
+    else text = { READY: '"READY"', MOVING: 'READY', ATTACK: '…', COOLDOWN: 'COOLDOWN', RESET: 'RESET HAND' }[p.state];
+    const pop = recent ? 1 + 0.25 * Math.max(0, 1 - (now - p.attackT) / 200) : 1;
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(pop, pop);
+    txt(text, 0, 0, size, color, 'center', FONT, 900, recent ? 20 : 6);
+    ctx.restore();
+    // attack indicator: cooldown / reset bar
+    const bw = Math.min(W * 0.26, 300), bx = cx - bw / 2, bY = y0 + botH * 0.7;
+    ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(bx, bY, bw, 6);
+    let f = 1, bc = p.color;
+    if (p.state === 'COOLDOWN') { f = 1 - c01((p.cooldownUntil - now) / CFG.cooldown); bc = '#8a86b8'; }
+    else if (p.state === 'RESET') { f = 0.15; bc = '#ffe45c'; }
+    ctx.fillStyle = bc; ctx.fillRect(bx, bY, bw * f, 6);
+    txt(`P${p.num} · ${stateLabel(p, now)}`, cx, bY + 16, 10, 'rgba(200,190,255,0.7)', 'center', FONT, 700);
+  }
+}
+
+function drawStateOverlay(now) {
+  const cx = VR.x + VR.w / 2;
+  if (state === 'LOADING') {
+    ctx.fillStyle = 'rgba(5,3,13,0.85)'; ctx.fillRect(0, 0, W, H);
+    outlined('WEBCAM GESTURE FIGHTER', W / 2, H * 0.42, clamp(W * 0.045, 22, 52), '#e0d8ff', 24);
+    txt(loadingMsg, W / 2, H * 0.52, 17, 'rgba(200,190,255,0.85)', 'center', FONT, 700);
+    ctx.save(); ctx.strokeStyle = '#00f0ff'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(W / 2, H * 0.62, 18, now / 200, now / 200 + 4.2); ctx.stroke(); ctx.restore();
+    return;
+  }
+  if (state === 'PLAYER_POSITIONING' || state === 'READY') {
+    // big side labels
+    for (const p of players) {
+      const x = VR.x + VR.w * (p.num === 2 ? 0.25 : 0.75);
+      ctx.save(); ctx.globalAlpha = 0.9;
+      txt(`PLAYER ${p.num}`, x, VR.y + VR.h * 0.8, clamp(VR.w * 0.035, 16, 34), p.color, 'center', FONT, 900, 14);
+      txt(p.num === 2 ? 'LEFT SIDE' : 'RIGHT SIDE', x, VR.y + VR.h * 0.8 + clamp(VR.w * 0.03, 14, 28), clamp(VR.w * 0.018, 11, 17), '#fff', 'center', FONT, 700);
+      ctx.restore();
+    }
+    const bw = clamp(VR.w * 0.42, 280, 480), bh = 176, bx = cx - bw / 2, by = VR.y + VR.h * 0.2;
+    box(bx, by, bw, bh, 'rgba(179,136,255,0.7)', 0.82);
+    txt(state === 'READY' ? 'STARTING…' : 'GET READY', cx, by + 26, 24, state === 'READY' ? '#ffe45c' : '#fff', 'center', FONT, 900, 14);
+    txt('Stay on your side of the camera.', cx, by + 56, 14, '#d7d2ff', 'center', FONT, 600);
+    txt('Move your hands to test detection.', cx, by + 76, 14, '#d7d2ff', 'center', FONT, 600);
+    [2, 1].forEach((n, i) => {
+      const p = pl(n);
+      txt(`PLAYER ${n}: ${p.detected ? '✓ DETECTED' : '… WAITING'}`, cx, by + 106 + i * 22, 15, p.detected ? p.color : 'rgba(200,190,255,0.6)', 'center', FONT, 900);
+    });
+    const hold = state === 'READY' ? c01((now - stateT) / CFG.readyMs) : posSince ? c01((now - posSince) / CFG.detectHoldMs) : 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(bx + 20, by + bh - 18, bw - 40, 5);
+    ctx.fillStyle = '#ffe45c'; ctx.fillRect(bx + 20, by + bh - 18, (bw - 40) * hold, 5);
+    return;
+  }
+  if (state === 'COUNTDOWN') {
+    const left = stateT + CFG.countdownMs - now, n = Math.max(1, Math.ceil(left / 1000)), frac = (left % 1000) / 1000;
+    ctx.save(); ctx.globalAlpha = 0.4 + 0.6 * frac;
+    outlined(String(n), cx, VR.y + VR.h * 0.45, clamp(VR.h * 0.4, 80, 240) * (0.8 + 0.4 * frac), '#fff', 40);
+    ctx.restore();
+    return;
+  }
+  if (state === 'FIGHTING') {
+    if (now - fightT < 900) {
+      const k = (now - fightT) / 900;
+      ctx.save(); ctx.globalAlpha = 1 - c01((k - 0.6) / 0.4);
+      outlined('FIGHT!', cx, VR.y + VR.h * 0.45, clamp(VR.h * 0.3, 60, 180) * (1.4 - 0.4 * c01(k / 0.2)), '#ffe45c', 40);
+      ctx.restore();
+    }
+    for (const p of players) if (!p.detected && !ko) {
+      txt(`PLAYER ${p.num} NOT DETECTED — step back into view`, VR.x + VR.w * (p.num === 2 ? 0.25 : 0.75), VR.y + VR.h * 0.9, 14, '#ff9aac', 'center', FONT, 900, 8);
+    }
+    return;
+  }
+  if (state === 'GAME_OVER' && result) {
+    ctx.fillStyle = 'rgba(5,2,15,0.55)'; ctx.fillRect(VR.x, VR.y, VR.w, VR.h);
+    const bw = clamp(VR.w * 0.46, 300, 520), bh = clamp(VR.h * 0.62, 260, 380), bx = cx - bw / 2, by = VR.y + (VR.h - bh) / 2 - 20;
+    box(bx, by, bw, bh, 'rgba(255,228,92,0.7)', 0.9);
+    outlined(result.reason === 'K.O.' ? 'K.O.!' : 'TIME!', cx, by + bh * 0.14, clamp(bh * 0.15, 32, 58), '#ff4d6d', 30);
+    const wc = result.winner ? CFG.colors[result.winner] : '#ffe45c';
+    txt(result.winner ? `PLAYER ${result.winner} WINS` : 'DRAW', cx, by + bh * 0.32, clamp(bh * 0.09, 20, 34), wc, 'center', FONT, 900, 18);
+    const order = players.slice().sort((a, b) => a.hp - b.hp);
+    order.forEach((p, i) => {
+      const y = by + bh * (0.47 + i * 0.1);
+      txt(`PLAYER ${p.num}`, cx - 20, y, 17, p.color, 'right', FONT, 900);
+      txt(`${Math.ceil(p.hp)} HP   ·   ${p.stats.hits} hits`, cx + 20, y, 17, '#fff', 'left', FONT, 700);
+    });
+    txt('Both players raise a hand above your head to rematch', cx, by + bh * 0.72, 12.5, 'rgba(220,215,255,0.8)', 'center', FONT, 600);
+    players.slice().reverse().forEach((p, i) => {
+      const mw = bw * 0.3, mx = cx + (i === 0 ? -mw - 10 : 10), my = by + bh * 0.79;
+      ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(mx, my, mw, 6);
+      ctx.fillStyle = p.color; ctx.fillRect(mx, my, mw * p.raise, 6);
+    });
+    return;
+  }
+  if (state === 'REMATCH') outlined('REMATCH!', cx, VR.y + VR.h * 0.45, clamp(VR.h * 0.18, 44, 120), '#ffe45c', 36);
+}
+
+function drawDebug(now) {
+  if (!settings.debug) return;
+  const s = settings.sensitivity, C = CFG.punch;
+  const common = [
+    `CV ${CV.fps.toFixed(0)} fps · ${CV.ms.toFixed(1)} ms · hands:${CV.delegate} pose:${CV.pose ? (settings.pose ? CV.poseDelegate : 'off') : 'n/a'} · render ${fps.v.toFixed(0)} fps`,
+    `tracks ${tracks.filter(t => now - t.lastSeen < 150).length} · frame-diff ${Motion.ok ? (Motion.changed * 100).toFixed(1) + '%' : 'n/a'} · exposure ${Motion.exposure ? 'FILTERED' : 'ok'}`,
+    `sens ${s.toFixed(2)} → speed ≥${(C.minSpeed / s).toFixed(2)} w/s · dist ≥${(C.minDist / s).toFixed(3)} w · conf ≥${CFG.conf}`,
+  ];
+  ctx.save(); ctx.font = `600 11.5px ${MONO}`; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+  const lh = 14;
+  for (const p of players) {
+    const show = p.last && now - p.last.t < 2500 ? p.last : p.live;
+    const lines = [`PLAYER ${p.num} · state ${p.state} · body ${p.body && now - p.body.t < 500 ? 'pose' : 'est'} x=${p.bodyX.toFixed(2)}`];
+    if (show) {
+      lines.push(`${show === p.last ? 'LAST ATTACK' : 'LIVE'} ${(show.kind || '').toUpperCase()}  overall ${pct(show.overall)}  disp ${show.disp.toFixed(3)} peak ${show.peak.toFixed(2)}`);
+      for (const k in CFG.weights) lines.push(['bar', k, show.parts[k]]);
+      if (show.failed && show.failed.length) lines.push(`gates failed: ${show.failed.join(', ')}`);
+    } else lines.push('no hand');
+    if (p.num === 2) lines.push('', ...common);
+    const w = 390, h = lines.length * lh + 12;
+    const x = p.num === 2 ? 8 : W - w - 8, y = H - botH - h - 8;
+    ctx.fillStyle = 'rgba(5,2,15,0.85)'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = p.color; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    lines.forEach((l, i) => {
+      const ly = y + 6 + i * lh;
+      if (Array.isArray(l)) {
+        ctx.fillStyle = '#d7d2ff'; ctx.fillText(l[1].padEnd(13) + (l[2] || 0).toFixed(2), x + 8, ly);
+        ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(x + 150, ly + 3, 220, 7);
+        ctx.fillStyle = p.color; ctx.fillRect(x + 150, ly + 3, 220 * c01(l[2] || 0), 7);
+      } else { ctx.fillStyle = i === 0 ? p.color : '#d7d2ff'; ctx.fillText(l, x + 8, ly); }
+    });
+  }
+  ctx.restore();
+}
+
+function render(now) {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  computeVR();
+  ctx.save();
+  if (FX.shake > 0) ctx.translate(rand(-FX.shake, FX.shake), rand(-FX.shake, FX.shake));
+  drawFeed(now);
+  if (settings.overlay) drawCV(now);
+  drawEffects(now);
+  ctx.restore();
+  if (settings.overlay && state !== 'LOADING' && state !== 'CAMERA_PERMISSION') drawInfoPanels(now);
+  drawHUD(now);
+  drawBottom(now);
+  drawStateOverlay(now);
+  drawDebug(now);
+}
+
+// ---------------------------------------------------------------- Game loop
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (Math.max(320, window.innerWidth) !== W || Math.max(240, window.innerHeight) !== H) layout();
+  const dt = Math.min(100, now - lastNow); lastNow = now;
+  fps.acc += dt; fps.n++; if (fps.acc >= 500) { fps.v = fps.n * 1000 / fps.acc; fps.acc = 0; fps.n = 0; }
+  cvStep(now);
+  update(now, dt);
+  render(now);
+  if (fps.n === 0) $('#soundHint').style.display = settings.sound && !Sound.on ? 'block' : 'none';
+}
+
+// ---------------------------------------------------------------- UI (mouse only — never used for combat)
+function refreshPanel() {
+  const ov = $('#overlay'), panel = $('#panel');
+  let html = '';
+  if (ui.settings) {
+    html = `<h1>SETTINGS</h1>
+      <div class="set">
+        <label>Gesture sensitivity<small>Higher = slower / shorter strikes count. Lower = fewer false hits.</small></label>
+        <span><input type="range" id="sSens" min="0.6" max="1.6" step="0.05" value="${settings.sensitivity}"> <b id="sSensV">${settings.sensitivity.toFixed(2)}</b></span>
+        <label>Body tracking (MediaPipe Pose)<small>Better player assignment, range and walking rejection.</small></label><input type="checkbox" id="sPose" ${settings.pose ? 'checked' : ''} ${CV.pose ? '' : 'disabled'}>
+        <label>Advanced attacks<small>Heavy strike (fast + long, 25) and two-hand special (30).</small></label><input type="checkbox" id="sAdv" ${settings.advanced ? 'checked' : ''}>
+        <label>Uppercut<small>Fast upward strike (20). Requires advanced attacks.</small></label><input type="checkbox" id="sUpper" ${settings.uppercut ? 'checked' : ''}>
+        <label>CV overlay<small>Hand skeletons, vectors and per-player info.</small></label><input type="checkbox" id="sOverlay" ${settings.overlay ? 'checked' : ''}>
+        <label>Debug details<small>Confidence breakdown, gates, CV timing.</small></label><input type="checkbox" id="sDebug" ${settings.debug ? 'checked' : ''}>
+        <label>Sound</label><input type="checkbox" id="sSound" ${settings.sound ? 'checked' : ''}>
+      </div>
+      <div class="btns"><button class="btn primary" data-act="closeSettings">DONE</button></div>`;
+  } else if (fatal) {
+    html = `<h1>COMPUTER VISION FAILED TO LOAD</h1>
+      <div class="err">${fatal}</div>
+      <p class="small">MediaPipe is loaded from cdn.jsdelivr.net and storage.googleapis.com — an internet connection is required.</p>
+      <div class="btns"><button class="btn primary" data-act="reload">RELOAD</button></div>`;
+  } else if (state === 'CAMERA_PERMISSION') {
+    html = `<h1>WEBCAM GESTURE FIGHTER</h1>
+      <p>The webcam is the controller. Please allow camera access.</p>
+      ${camera.error ? `<div class="err">${CAM_ERRORS[camera.error]}</div>` : `<p class="small">${camera.requesting ? 'Waiting for camera permission… check your browser prompt.' : 'Starting camera…'}</p>`}
+      ${camera.error ? '<div class="btns"><button class="btn primary" data-act="retryCamera">RETRY CAMERA</button></div>' : ''}
+      <p class="small">Video is processed locally and never leaves this device.</p>`;
+  }
+  panel.innerHTML = html;
+  ov.classList.toggle('show', !!html);
+  syncToolbar();
+}
+const ui = { settings: false };
+
+function syncToolbar() {
+  const b = act => document.querySelector(`#toolbar [data-act="${act}"]`);
+  b('overlay').classList.toggle('on', settings.overlay);
+  b('debug').classList.toggle('on', settings.debug);
+  b('sound').classList.toggle('off', !settings.sound);
+  b('sound').textContent = settings.sound ? 'SOUND' : 'MUTED';
+  b('settings').classList.toggle('on', ui.settings);
+}
+
+document.addEventListener('pointerdown', () => Sound.unlock(), { passive: true });
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  switch (b.dataset.act) {
+    case 'settings': ui.settings = !ui.settings; refreshPanel(); break;
+    case 'closeSettings': ui.settings = false; refreshPanel(); break;
+    case 'overlay': settings.overlay = !settings.overlay; saveSettings(); syncToolbar(); break;
+    case 'debug': settings.debug = !settings.debug; saveSettings(); syncToolbar(); break;
+    case 'sound': settings.sound = !settings.sound; saveSettings(); if (settings.sound) Sound.unlock(); syncToolbar(); break;
+    case 'fullscreen':
+      if (document.fullscreenElement) document.exitFullscreen?.(); else document.documentElement.requestFullscreen?.().catch(() => {});
+      break;
+    case 'retryCamera': startCamera(); break;
+    case 'reload': location.reload(); break;
+    case 'rematch': rematch(); break;
+  }
+  b.blur();
+});
+document.addEventListener('input', e => {
+  const id = e.target.id;
+  if (id === 'sSens') { settings.sensitivity = +e.target.value; $('#sSensV').textContent = settings.sensitivity.toFixed(2); }
+  const map = { sPose: 'pose', sAdv: 'advanced', sUpper: 'uppercut', sOverlay: 'overlay', sDebug: 'debug', sSound: 'sound' };
+  if (map[id]) settings[map[id]] = e.target.checked;
+  if (id === 'sSound' && settings.sound) Sound.unlock();
+  saveSettings(); syncToolbar();
+});
+
+// ---------------------------------------------------------------- Lifecycle
+function cleanup() { stopCamera(); if (Sound.ctx) try { Sound.ctx.close(); } catch (e) {} }
+window.addEventListener('pagehide', cleanup);
+window.addEventListener('resize', layout);
+
+// Developer / test hooks (console): inspect state or feed synthetic CV results in display coordinates.
+window.WGF = {
+  CFG, settings, players, get tracks() { return tracks; }, get state() { return state; }, CV, Motion,
+  simulate(on = true) { CV.synthetic = on; CV.ready = CV.ready || on; if (on && (state === 'LOADING' || state === 'CAMERA_PERMISSION')) { fatal = null; enterPositioning(); } },
+  feed(hands, bodies = null) { processFrame(hands.map(h => ({ score: 0.95, handedness: '?', lm: null, ...h })), bodies, performance.now()); },
+};
+
+// ---------------------------------------------------------------- Boot
+Motion.init();
+layout();
+syncToolbar();
+requestAnimationFrame(t => { lastNow = t; requestAnimationFrame(frame); });
+startCamera();                                               // camera permission is requested automatically
+CV.load().then(checkBootReady).catch(err => {
+  console.error('MediaPipe load failed', err);
+  if (CV.synthetic) return;
+  fatal = 'Could not load the MediaPipe hand-tracking model (' + (err && err.message ? err.message : err) + ').';
+  refreshPanel();
+});
+</script>
+</body>
+</html>
